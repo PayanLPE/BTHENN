@@ -40,6 +40,19 @@ namespace btree_henn
             for (int i = 0; i < ORDER; i++)
                 children[i] = nullptr;
         }
+
+        auto searchKNN(const void *query_data, int k)
+        {
+            if (henn_index)
+            {
+                return henn_index->searchKnn(query_data, k);
+            }
+            else
+            {
+                // No index, return empty result
+                return std::priority_queue<std::pair<float, hnswlib::labeltype>>();
+            }
+        }
     };
 
     // class for B-Tree
@@ -136,22 +149,6 @@ namespace btree_henn
 
             if (!x->leaf)
                 traverse(x->children[i]);
-        }
-
-        // Function to search a key in the tree
-        BTreeNode<T, ORDER> *search(BTreeNode<T, ORDER> *x, T k)
-        {
-            int i = 0;
-            while (i < x->n && k > x->keys[i].first)
-                i++;
-
-            if (i < x->n && k == x->keys[i].first)
-                return x;
-
-            if (x->leaf)
-                return nullptr;
-
-            return search(x->children[i], k);
         }
 
     public:
@@ -259,14 +256,134 @@ namespace btree_henn
         }
 
         // Function to range query in the tree
-        std::priority_queue<std::pair<dist_t, labeltype>> rangeSearchANN(T k1, T k2)
+        std::priority_queue<std::pair<T, hnswlib::labeltype>> rangeSearchKNN(T k1, T k2, int k)
         {
-            if (root != nullptr)
+            if (root == nullptr)
             {
-                std::priority_queue<std::pair<dist_t, hnswlib::labeltype>> result = rangeSearch(root, k1, k2);
-                return result;
+                return std::priority_queue<std::pair<T, hnswlib::labeltype>>();
+                
             }
-            return std::priority_queue<std::pair<dist_t, hnswlib::labeltype>>();
+
+            std::priority_queue<std::pair<T, hnswlib::labeltype>> result = rangeSearchKNN(root, k1, k2, k);
+            return result;
+        }
+
+        // Function to find canonical nodes for range [k1, k2]
+        vector<BTreeNode<T, ORDER> *> findCanonicalNodes(T k1, T k2)
+        {
+            vector<BTreeNode<T, ORDER> *> canonical_nodes;
+            BTreeNode<T, ORDER> *node = root;
+            BTreeNode<T, ORDER> *split_node = nullptr;
+            int i1 = 0, i2 = 0; // Declare here to be accessible after the loop
+            
+            if (node == nullptr)
+                return canonical_nodes;
+
+            // Find the split node
+            while (!node->leaf)
+            {
+                // Route k1
+                i1 = 0;
+                while (i1 < node->n && k1 >= node->keys[i1].first)
+                    i1++;
+                
+                // Route k2
+                i2 = 0;
+                while (i2 < node->n && k2 >= node->keys[i2].first)
+                    i2++;
+                
+                // In the same range, go to that child
+                if (i1 == i2)
+                {
+                    node = node->children[i1];
+                }
+                else
+                {
+                    split_node = node;
+                    // Add the children of the split node between i1 and i2
+                    for (int j = i1 + 1; j < i2; j++)
+                    {
+                        canonical_nodes.push_back(split_node->children[j]);
+                    }
+                    break;
+                }
+            }
+            cout << "Split node keys: ";
+            for (auto node : split_node->keys)
+            {
+                cout << node.first << " ";
+            }
+            cout << endl;
+
+            
+            if (split_node == nullptr)
+                return canonical_nodes;
+
+            // Left path: walk down to leaf, add all the children nodes to the right
+            BTreeNode<T, ORDER> *left_node = split_node->children[i1];
+            while (!left_node->leaf)
+            {
+                int index = 0;
+                for (int i = 0; i < left_node->n; i++)
+                {
+                    if (k1 <= left_node->keys[i].first)
+                    {
+                        // Add all children to the right of the current position
+                        for (int j = i + 1; j <= left_node->n; j++)
+                        {
+                            canonical_nodes.push_back(left_node->children[j]);
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        index = i + 1;
+                    }
+                }
+                left_node = left_node->children[index];
+            }
+
+            // Right path: walk down to leaf, add all the children nodes to the left
+            BTreeNode<T, ORDER> *right_node = split_node->children[i2];
+            while (!right_node->leaf)
+            {
+                int index = right_node->n; // Default to rightmost child
+                for (int i = right_node->n - 1; i >= 0; i--)
+                {
+                    if (k2 >= right_node->keys[i].first)
+                    {
+                        // Add all children to the left of the current position
+                        for (int j = 0; j <= i; j++)
+                        {
+                            canonical_nodes.push_back(right_node->children[j]);
+                        }
+                        index = i + 1;
+                        break;
+                    }
+                }
+                right_node = right_node->children[index];
+            }
+
+            return canonical_nodes;
+        }
+
+        // Function to search a key in the tree
+        std::priority_queue<std::pair<T, hnswlib::labeltype>> rangeSearchKNN(T k1, T k2, int k)
+        {
+            auto result = priority_queue<std::pair<T, hnswlib::labeltype>>();
+            auto nodes  = findCanonicalNodes(k1, k2);
+            for (auto node : nodes) {
+                cout << "Canonical node keys: ";
+                for (int i = 0; i < node->n; i++) {
+                    cout << node->keys[i].first << " ";
+                }
+                cout << endl;
+               auto node_results = node->henn_index->searchKnn(node->henn_data.data(), k);
+               for (; !node_results.empty(); node_results.pop()) {
+                   result.push(node_results.top());
+               }
+            }
+            return result;
         }
 
         // Function to get the root node (for testing and debugging)
