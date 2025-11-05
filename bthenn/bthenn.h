@@ -43,9 +43,25 @@ namespace btree_henn
 
         auto searchKNN(const void *query_data, int k)
         {
-            if (henn_index)
+            if (henn_index && !henn_indices.empty())
             {
-                return henn_index->searchKnn(query_data, k);
+                auto results = henn_index->searchKnn(query_data, k);
+                // Map the labels back to original indices
+                std::priority_queue<std::pair<float, hnswlib::labeltype>> mapped_results;
+
+                while (!results.empty())
+                {
+                    auto pair = results.top();
+                    results.pop();
+                    // pair.second is the label in the HENN index (0-based)
+                    // Map it back to the original index using henn_indices
+                    if (pair.second < henn_indices.size())
+                    {
+                        hnswlib::labeltype original_index = henn_indices[pair.second];
+                        mapped_results.push({pair.first, original_index});
+                    }
+                }
+                return mapped_results;
             }
             else
             {
@@ -151,41 +167,6 @@ namespace btree_henn
                 traverse(x->children[i]);
         }
 
-    public:
-        BTree(int dimension = 128) : dim(dimension)
-        {
-            root = new BTreeNode<T, ORDER>(true);
-            l2space = new hnswlib::L2Space(dim);
-        }
-
-        ~BTree()
-        {
-            delete l2space;
-        }
-
-        // Function to insert a key in the tree
-        void insert(T k, int index)
-        {
-            if (root->n == ORDER - 1)
-            {
-                BTreeNode<T, ORDER> *s = new BTreeNode<T, ORDER>(false);
-                s->children[0] = root;
-                root = s;
-                splitChild(s, 0);
-                insertNonFull(s, k, index);
-            }
-            else
-                insertNonFull(root, k, index);
-        }
-
-        void build_henn_index(float *data, int num_elements, int dimension)
-        {
-            henn_data = data;
-            dim = dimension;
-            n = num_elements;
-            build_henn_recursive(root);
-        }
-
         void build_henn_recursive(BTreeNode<T, ORDER> *node)
         {
             if (node == nullptr)
@@ -216,6 +197,10 @@ namespace btree_henn
                     }
                 }
             }
+
+            if (node->henn_indices.empty())
+                return;
+
             // Allocate memory for the node's HENN data
             node->henn_data = new float[dim * node->henn_indices.size()];
 
@@ -230,22 +215,44 @@ namespace btree_henn
                 }
             }
 
-            // Create HENN index for this node if it has enough points
-            if (node->henn_indices.size() > 1)
-            { // Need at least 2 points for HENN
-                // Use HENN algorithm to build hierarchical index
-                int M = 1;        // Hierarchy parameter - you can tune this
-                bool best = true; // Use best epsilon nets
+            int M = 1; // Hierarchy parameter - you can tune this
+            node->henn_index = unique_ptr<HierarchicalNSW<float>>(
+                henn::buildHENN(node->henn_data, node->henn_indices.size(), dim, l2space, M, true));
+        }
 
-                node->henn_index = unique_ptr<HierarchicalNSW<float>>(
-                    henn::buildHENN(node->henn_data, node->henn_indices.size(), dim, l2space, M, best));
-            }
-            else if (node->henn_indices.size() == 1)
+    public:
+        BTree(int dimension = 128) : dim(dimension)
+        {
+            root = new BTreeNode<T, ORDER>(true);
+        }
+
+        ~BTree()
+        {
+            delete l2space;
+        }
+
+        // Function to insert a key in the tree
+        void insert(T k, int index)
+        {
+            if (root->n == ORDER - 1)
             {
-                // For single point, create simple HNSW index
-                node->henn_index = make_unique<HierarchicalNSW<float>>(l2space, 1, 16, 200);
-                node->henn_index->addPoint(&node->henn_data[0], 0);
+                BTreeNode<T, ORDER> *s = new BTreeNode<T, ORDER>(false);
+                s->children[0] = root;
+                root = s;
+                splitChild(s, 0);
+                insertNonFull(s, k, index);
             }
+            else
+                insertNonFull(root, k, index);
+        }
+
+        void build_henn_index(float *data, int num_elements, int dimension)
+        {
+            henn_data = data;
+            l2space = new hnswlib::L2Space(dimension);
+            dim = dimension;
+            n = num_elements;
+            build_henn_recursive(root);
         }
 
         // Function to traverse the tree
@@ -255,19 +262,6 @@ namespace btree_henn
                 traverse(root);
         }
 
-        // Function to range query in the tree
-        std::priority_queue<std::pair<T, hnswlib::labeltype>> rangeSearchKNN(T k1, T k2, int k)
-        {
-            if (root == nullptr)
-            {
-                return std::priority_queue<std::pair<T, hnswlib::labeltype>>();
-                
-            }
-
-            std::priority_queue<std::pair<T, hnswlib::labeltype>> result = rangeSearchKNN(root, k1, k2, k);
-            return result;
-        }
-
         // Function to find canonical nodes for range [k1, k2]
         vector<BTreeNode<T, ORDER> *> findCanonicalNodes(T k1, T k2)
         {
@@ -275,7 +269,7 @@ namespace btree_henn
             BTreeNode<T, ORDER> *node = root;
             BTreeNode<T, ORDER> *split_node = nullptr;
             int i1 = 0, i2 = 0; // Declare here to be accessible after the loop
-            
+
             if (node == nullptr)
                 return canonical_nodes;
 
@@ -286,12 +280,12 @@ namespace btree_henn
                 i1 = 0;
                 while (i1 < node->n && k1 >= node->keys[i1].first)
                     i1++;
-                
+
                 // Route k2
                 i2 = 0;
                 while (i2 < node->n && k2 >= node->keys[i2].first)
                     i2++;
-                
+
                 // In the same range, go to that child
                 if (i1 == i2)
                 {
@@ -315,7 +309,6 @@ namespace btree_henn
             }
             cout << endl;
 
-            
             if (split_node == nullptr)
                 return canonical_nodes;
 
@@ -343,6 +336,8 @@ namespace btree_henn
                 left_node = left_node->children[index];
             }
 
+            // now that left_node is left, we need to find a way to add the key that is in the range
+
             // Right path: walk down to leaf, add all the children nodes to the left
             BTreeNode<T, ORDER> *right_node = split_node->children[i2];
             while (!right_node->leaf)
@@ -368,22 +363,58 @@ namespace btree_henn
         }
 
         // Function to search a key in the tree
-        std::priority_queue<std::pair<T, hnswlib::labeltype>> rangeSearchKNN(T k1, T k2, int k)
+        auto rangeSearchKNN(T k1, T k2, float *data, int k)
         {
-            auto result = priority_queue<std::pair<T, hnswlib::labeltype>>();
-            auto nodes  = findCanonicalNodes(k1, k2);
-            for (auto node : nodes) {
+            auto result = std::priority_queue<std::pair<float, hnswlib::labeltype>>();
+            auto nodes = findCanonicalNodes(k1, k2);
+            for (auto node : nodes)
+            {
                 cout << "Canonical node keys: ";
-                for (int i = 0; i < node->n; i++) {
+                for (int i = 0; i < node->n; i++)
+                {
                     cout << node->keys[i].first << " ";
                 }
                 cout << endl;
-               auto node_results = node->henn_index->searchKnn(node->henn_data.data(), k);
-               for (; !node_results.empty(); node_results.pop()) {
-                   result.push(node_results.top());
-               }
+                auto node_results = node->searchKNN(data, k);
+                for (; !node_results.empty(); node_results.pop())
+                {
+                    result.push(node_results.top());
+                }
+                for (; result.size() > k;)
+                {
+                    result.pop();
+                }
             }
             return result;
+        }
+
+        // debugging function to perform KNN search on root node
+        void knnOnRootNode(float *data, int k)
+        {
+            if (!root || !root->henn_index)
+            {
+                cout << "No HENN index available on root node" << endl;
+                return;
+            }
+
+            cout << "Root node has " << root->henn_indices.size() << " points" << endl;
+            cout << "Query point: [" << data[0] << ", " << data[1] << "]" << endl;
+
+            auto result = root->searchKNN(data, k);
+            cout << "KNN results for root node:" << endl;
+            int count = 0;
+            while (!result.empty() && count < k)
+            {
+                auto pair = result.top();
+                cout << "Distance: " << pair.first << ", Original Index: " << pair.second;
+                if (pair.second < n)
+                {
+                    cout << " (Data: [" << henn_data[pair.second * dim] << ", " << henn_data[pair.second * dim + 1] << "])";
+                }
+                cout << endl;
+                result.pop();
+                count++;
+            }
         }
 
         // Function to get the root node (for testing and debugging)
