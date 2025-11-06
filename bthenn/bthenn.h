@@ -220,6 +220,115 @@ namespace btree_henn
                 henn::buildHENN(node->henn_data, node->henn_indices.size(), dim, l2space, M, true));
         }
 
+        // Helper function to print tree structure recursively
+        void printTreeStructureHelper(BTreeNode<T, ORDER> *node, int level, const string &prefix) const
+        {
+            if (node == nullptr)
+                return;
+
+            // Print indentation for current level
+            for (int i = 0; i < level; i++)
+            {
+                cout << "    ";
+            }
+
+            cout << prefix;
+
+            // Print node type
+            if (node->leaf)
+            {
+                cout << "[LEAF] ";
+            }
+            else
+            {
+                cout << "[INTERNAL] ";
+            }
+
+            // Print keys in this node
+            cout << "Keys(" << node->n << "): [";
+            for (int i = 0; i < node->n; i++)
+            {
+                cout << node->keys[i].first << " (Index: " << node->keys[i].second << ")";
+                if (i < node->n - 1)
+                    cout << ", ";
+            }
+            cout << "]";
+            cout << "; HENN Indices: {";
+            for (size_t i = 0; i < node->henn_indices.size();
+                 i++)
+            {
+                cout << node->henn_indices[i];
+                if (i < node->henn_indices.size() - 1)
+                    cout << ", ";
+            }
+            cout << "}";
+
+            // Print HENN data information
+            if (node->henn_data)
+            {
+                cout << "; HENN Data: [";
+                for (size_t i = 0; i < dim * node->henn_indices.size(); i++)
+                {
+                    cout << node->henn_data[i];
+                    if (i < dim * node->henn_indices.size() - 1)
+                        cout << ", ";
+                }
+                cout << "]";
+            }
+            else
+            {
+                cout << "; No HENN Data";
+            }
+
+            // Print memory address for debugging
+            cout << " @" << node << endl;
+
+            // Recursively print children
+            if (!node->leaf)
+            {
+                for (int i = 0; i <= node->n; i++)
+                {
+                    string childPrefix = "Child[" + to_string(i) + "]: ";
+                    printTreeStructureHelper(node->children[i], level + 1, childPrefix);
+                }
+            }
+        }
+
+
+        BTreeNode<T, ORDER> *createDummyNodeFromIndices(const vector<pair<T, int>> &indices_not_covered)
+        {
+            if (indices_not_covered.empty())
+                return nullptr;
+
+            BTreeNode<T, ORDER> *dummy_node = new BTreeNode<T, ORDER>(true);
+            size_t m = indices_not_covered.size();
+
+            // copy keys
+            for (size_t i = 0; i < m; ++i)
+                dummy_node->keys[i] = indices_not_covered[i];
+            dummy_node->n = static_cast<int>(m);
+
+            // build henn_indices
+            dummy_node->henn_indices.clear();
+            dummy_node->henn_indices.reserve(m);
+            for (size_t i = 0; i < m; ++i)
+                dummy_node->henn_indices.push_back(indices_not_covered[i].second);
+
+            // copy data
+            dummy_node->henn_data = new float[dim * dummy_node->henn_indices.size()];
+            for (size_t j = 0; j < dummy_node->henn_indices.size(); ++j)
+            {
+                int idx = dummy_node->henn_indices[j];
+                for (int d = 0; d < dim; ++d)
+                    dummy_node->henn_data[j * dim + d] = henn_data[idx * dim + d];
+            }
+
+            int M = 1; // tuning parameter
+            dummy_node->henn_index = unique_ptr<HierarchicalNSW<float>>(
+                henn::buildHENN(dummy_node->henn_data, dummy_node->henn_indices.size(), dim, l2space, M, true));
+
+            return dummy_node;
+        }
     public:
         BTree(int dimension = 128) : dim(dimension)
         {
@@ -302,19 +411,28 @@ namespace btree_henn
                     break;
                 }
             }
+
+            // Debug output
             cout << "Split node keys: ";
-            for (auto node : split_node->keys)
+            for (int i = 0; i < split_node->n; i++)
             {
-                cout << node.first << " ";
+                cout << split_node->keys[i].first << " ";
             }
             cout << endl;
 
             if (split_node == nullptr)
                 return canonical_nodes;
 
+            // Store a list of indices of keys in the nodes that we traverse down
+            vector<pair<T, int>> indices_not_covered;
+            for (int i = i1; i < i2; i++)
+            {
+                indices_not_covered.push_back(make_pair(split_node->keys[i].first, split_node->keys[i].second));
+            }
+
             // Left path: walk down to leaf, add all the children nodes to the right
             BTreeNode<T, ORDER> *left_node = split_node->children[i1];
-            while (!left_node->leaf)
+            while (left_node != nullptr)
             {
                 int index = 0;
                 for (int i = 0; i < left_node->n; i++)
@@ -324,7 +442,16 @@ namespace btree_henn
                         // Add all children to the right of the current position
                         for (int j = i + 1; j <= left_node->n; j++)
                         {
-                            canonical_nodes.push_back(left_node->children[j]);
+                            if (left_node->children[j] != nullptr)
+                            {
+                                canonical_nodes.push_back(left_node->children[j]);
+                            }
+                        }
+
+                        // Add all the key to the right of current position
+                        for (; i < left_node->n; i++)
+                        {
+                            indices_not_covered.push_back(make_pair(left_node->keys[i].first, left_node->keys[i].second));
                         }
                         break;
                     }
@@ -336,11 +463,9 @@ namespace btree_henn
                 left_node = left_node->children[index];
             }
 
-            // now that left_node is left, we need to find a way to add the key that is in the range
-
             // Right path: walk down to leaf, add all the children nodes to the left
             BTreeNode<T, ORDER> *right_node = split_node->children[i2];
-            while (!right_node->leaf)
+            while (right_node != nullptr)
             {
                 int index = right_node->n; // Default to rightmost child
                 for (int i = right_node->n - 1; i >= 0; i--)
@@ -350,13 +475,29 @@ namespace btree_henn
                         // Add all children to the left of the current position
                         for (int j = 0; j <= i; j++)
                         {
-                            canonical_nodes.push_back(right_node->children[j]);
+                            if (right_node->children[j] != nullptr)
+                            {
+                                canonical_nodes.push_back(right_node->children[j]);
+                            }
                         }
                         index = i + 1;
+
+                        // Add all the key to the left of current position
+                        for (int j = 0; j <= i; j++)
+                        {
+                            indices_not_covered.push_back(make_pair(right_node->keys[j].first, right_node->keys[j].second));
+                        }
                         break;
                     }
                 }
                 right_node = right_node->children[index];
+            }
+
+            // Finally, create a new dummy node to cover the remaining indices
+            if (!indices_not_covered.empty())
+            {
+                BTreeNode<T, ORDER> *dummy_node = createDummyNodeFromIndices(indices_not_covered);
+                canonical_nodes.push_back(dummy_node);
             }
 
             return canonical_nodes;
@@ -434,81 +575,6 @@ namespace btree_henn
             }
             printTreeStructureHelper(root, 0, "Root: ");
             cout << endl;
-        }
-
-    private:
-        // Helper function to print tree structure recursively
-        void printTreeStructureHelper(BTreeNode<T, ORDER> *node, int level, const string &prefix) const
-        {
-            if (node == nullptr)
-                return;
-
-            // Print indentation for current level
-            for (int i = 0; i < level; i++)
-            {
-                cout << "    ";
-            }
-
-            cout << prefix;
-
-            // Print node type
-            if (node->leaf)
-            {
-                cout << "[LEAF] ";
-            }
-            else
-            {
-                cout << "[INTERNAL] ";
-            }
-
-            // Print keys in this node
-            cout << "Keys(" << node->n << "): [";
-            for (int i = 0; i < node->n; i++)
-            {
-                cout << node->keys[i].first << " (Index: " << node->keys[i].second << ")";
-                if (i < node->n - 1)
-                    cout << ", ";
-            }
-            cout << "]";
-            cout << "; HENN Indices: {";
-            for (size_t i = 0; i < node->henn_indices.size();
-                 i++)
-            {
-                cout << node->henn_indices[i];
-                if (i < node->henn_indices.size() - 1)
-                    cout << ", ";
-            }
-            cout << "}";
-
-            // Print HENN data information
-            if (node->henn_data)
-            {
-                cout << "; HENN Data: [";
-                for (size_t i = 0; i < dim * node->henn_indices.size(); i++)
-                {
-                    cout << node->henn_data[i];
-                    if (i < dim * node->henn_indices.size() - 1)
-                        cout << ", ";
-                }
-                cout << "]";
-            }
-            else
-            {
-                cout << "; No HENN Data";
-            }
-
-            // Print memory address for debugging
-            cout << " @" << node << endl;
-
-            // Recursively print children
-            if (!node->leaf)
-            {
-                for (int i = 0; i <= node->n; i++)
-                {
-                    string childPrefix = "Child[" + to_string(i) + "]: ";
-                    printTreeStructureHelper(node->children[i], level + 1, childPrefix);
-                }
-            }
         }
     };
 }
