@@ -330,7 +330,7 @@ namespace btree_henn
             return dummy_node;
         }
     public:
-        BTree(int dimension = 128) : dim(dimension)
+        BTree()
         {
             root = new BTreeNode<T, ORDER>(true);
         }
@@ -374,6 +374,7 @@ namespace btree_henn
         // Function to find canonical nodes for range [k1, k2]
         vector<BTreeNode<T, ORDER> *> findCanonicalNodes(T k1, T k2)
         {
+            cout << "Finding canonical nodes for range [" << k1 << ", " << k2 << "]" << endl;
             vector<BTreeNode<T, ORDER> *> canonical_nodes;
             BTreeNode<T, ORDER> *node = root;
             BTreeNode<T, ORDER> *split_node = nullptr;
