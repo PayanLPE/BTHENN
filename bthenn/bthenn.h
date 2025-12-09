@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <iostream>
 #include <string>
+#include <queue> // Added for priority_queue
 
 using namespace std;
 using namespace hnswlib;
@@ -27,6 +28,8 @@ namespace btree_henn
         int n;
         // True if leaf node, false otherwise
         bool leaf;
+        // Flag to identify dummy/temporary nodes for cleanup
+        bool is_temporary = false; 
 
         // Keep track of all henn data in subtree
         vector<int> henn_indices;
@@ -35,10 +38,17 @@ namespace btree_henn
         // store HENN index for this node
         unique_ptr<HierarchicalNSW<float>> henn_index;
 
-        BTreeNode(bool isLeaf = true) : n(0), leaf(isLeaf)
+        BTreeNode(bool isLeaf = true) : n(0), leaf(isLeaf), henn_data(nullptr)
         {
             for (int i = 0; i < ORDER; i++)
                 children[i] = nullptr;
+        }
+
+        ~BTreeNode() {
+            if (henn_data) {
+                delete[] henn_data;
+            }
+            // unique_ptr handles henn_index deletion automatically
         }
 
         auto searchKNN(const void *query_data, int k)
@@ -152,21 +162,7 @@ namespace btree_henn
             }
         }
 
-        // Function to traverse the tree
-        void traverse(BTreeNode<T, ORDER> *x)
-        {
-            int i;
-            for (i = 0; i < x->n; i++)
-            {
-                if (!x->leaf)
-                    traverse(x->children[i]);
-                cout << " " << x->keys[i].first;
-            }
-
-            if (!x->leaf)
-                traverse(x->children[i]);
-        }
-
+        // Helper to recursively build HENN
         void build_henn_recursive(BTreeNode<T, ORDER> *node)
         {
             if (node == nullptr)
@@ -215,101 +211,28 @@ namespace btree_henn
                 }
             }
 
-            int M = 1; // Hierarchy parameter - you can tune this
+            int M = 16;
             node->henn_index = unique_ptr<HierarchicalNSW<float>>(
                 henn::buildHENN(node->henn_data, node->henn_indices.size(), dim, l2space, M, true));
         }
 
-        // Helper function to print tree structure recursively
-        void printTreeStructureHelper(BTreeNode<T, ORDER> *node, int level, const string &prefix) const
-        {
-            if (node == nullptr)
-                return;
-
-            // Print indentation for current level
-            for (int i = 0; i < level; i++)
-            {
-                cout << "    ";
-            }
-
-            cout << prefix;
-
-            // Print node type
-            if (node->leaf)
-            {
-                cout << "[LEAF] ";
-            }
-            else
-            {
-                cout << "[INTERNAL] ";
-            }
-
-            // Print keys in this node
-            cout << "Keys(" << node->n << "): [";
-            for (int i = 0; i < node->n; i++)
-            {
-                cout << node->keys[i].first << " (Index: " << node->keys[i].second << ")";
-                if (i < node->n - 1)
-                    cout << ", ";
-            }
-            cout << "]";
-            cout << "; HENN Indices: {";
-            for (size_t i = 0; i < node->henn_indices.size();
-                 i++)
-            {
-                cout << node->henn_indices[i];
-                if (i < node->henn_indices.size() - 1)
-                    cout << ", ";
-            }
-            cout << "}";
-
-            // Print HENN data information
-            if (node->henn_data)
-            {
-                cout << "; HENN Data: [";
-                for (size_t i = 0; i < dim * node->henn_indices.size(); i++)
-                {
-                    cout << node->henn_data[i];
-                    if (i < dim * node->henn_indices.size() - 1)
-                        cout << ", ";
-                }
-                cout << "]";
-            }
-            else
-            {
-                cout << "; No HENN Data";
-            }
-
-            // Print memory address for debugging
-            cout << " @" << node << endl;
-
-            // Recursively print children
-            if (!node->leaf)
-            {
-                for (int i = 0; i <= node->n; i++)
-                {
-                    string childPrefix = "Child[" + to_string(i) + "]: ";
-                    printTreeStructureHelper(node->children[i], level + 1, childPrefix);
-                }
-            }
-        }
-
-
+        // Helper to create dummy node
         BTreeNode<T, ORDER> *createDummyNodeFromIndices(const vector<pair<T, int>> &indices_not_covered)
         {
-            if (indices_not_covered.empty())
+            if (indices_not_covered.empty() || !l2space || !henn_data)
                 return nullptr;
 
             BTreeNode<T, ORDER> *dummy_node = new BTreeNode<T, ORDER>(true);
+            dummy_node->is_temporary = true; // Mark for deletion
+            
             size_t m = indices_not_covered.size();
-
+            
             // copy keys
-            for (size_t i = 0; i < m; ++i)
+            for (size_t i = 0; i < m && i < ORDER - 1; ++i)
                 dummy_node->keys[i] = indices_not_covered[i];
-            dummy_node->n = static_cast<int>(m);
+            
+            dummy_node->n = (m < ORDER - 1) ? static_cast<int>(m) : ORDER - 1;
 
-            // build henn_indices
-            dummy_node->henn_indices.clear();
             dummy_node->henn_indices.reserve(m);
             for (size_t i = 0; i < m; ++i)
                 dummy_node->henn_indices.push_back(indices_not_covered[i].second);
@@ -319,25 +242,49 @@ namespace btree_henn
             for (size_t j = 0; j < dummy_node->henn_indices.size(); ++j)
             {
                 int idx = dummy_node->henn_indices[j];
-                for (int d = 0; d < dim; ++d)
-                    dummy_node->henn_data[j * dim + d] = henn_data[idx * dim + d];
+                if (idx >= 0 && idx < n) {
+                     for (int d = 0; d < dim; ++d)
+                        dummy_node->henn_data[j * dim + d] = henn_data[idx * dim + d];
+                }
             }
 
-            int M = 1; // tuning parameter
+            int M = 16; 
             dummy_node->henn_index = unique_ptr<HierarchicalNSW<float>>(
                 henn::buildHENN(dummy_node->henn_data, dummy_node->henn_indices.size(), dim, l2space, M, true));
 
             return dummy_node;
         }
-    public:
-        BTree()
+
+        void printTreeStructureHelper(BTreeNode<T, ORDER> *node, int level, const string &prefix) const
         {
-            root = new BTreeNode<T, ORDER>(true);
+            if (node == nullptr) return;
+            for (int i = 0; i < level; i++) cout << "    ";
+            cout << prefix;
+            if (node->leaf) cout << "[LEAF] ";
+            else cout << "[INTERNAL] ";
+            cout << "Keys(" << node->n << "): [";
+            for (int i = 0; i < node->n; i++)
+            {
+                cout << node->keys[i].first;
+                if (i < node->n - 1) cout << ", ";
+            }
+            cout << "]" << endl;
+            if (!node->leaf)
+            {
+                for (int i = 0; i <= node->n; i++)
+                {
+                    printTreeStructureHelper(node->children[i], level + 1, "Child[" + to_string(i) + "]: ");
+                }
+            }
         }
+
+    public:
+        // FIX 1: Initialize pointers to nullptr
+        BTree() : root(new BTreeNode<T, ORDER>(true)), henn_data(nullptr), l2space(nullptr), dim(0), n(0) {}
 
         ~BTree()
         {
-            delete l2space;
+            if (l2space) delete l2space;
         }
 
         // Function to insert a key in the tree
@@ -358,29 +305,21 @@ namespace btree_henn
         void build_henn_index(float *data, int num_elements, int dimension)
         {
             henn_data = data;
+            if (l2space) delete l2space;
             l2space = new hnswlib::L2Space(dimension);
             dim = dimension;
             n = num_elements;
             build_henn_recursive(root);
         }
 
-        // Function to traverse the tree
-        void traverse()
-        {
-            if (root != nullptr)
-                traverse(root);
-        }
-
-        // Function to find canonical nodes for range [k1, k2]
         vector<BTreeNode<T, ORDER> *> findCanonicalNodes(T k1, T k2)
         {
-            cout << "Finding canonical nodes for range [" << k1 << ", " << k2 << "]" << endl;
             vector<BTreeNode<T, ORDER> *> canonical_nodes;
             BTreeNode<T, ORDER> *node = root;
             BTreeNode<T, ORDER> *split_node = nullptr;
             int i1 = 0, i2 = 0; // Declare here to be accessible after the loop
-
-            if (node == nullptr)
+            
+            if (node == nullptr || l2space == nullptr)
                 return canonical_nodes;
 
             // Find the split node
@@ -388,13 +327,11 @@ namespace btree_henn
             {
                 // Route k1
                 i1 = 0;
-                while (i1 < node->n && k1 >= node->keys[i1].first)
-                    i1++;
+                while (i1 < node->n && k1 >= node->keys[i1].first) i1++;
 
                 // Route k2
                 i2 = 0;
-                while (i2 < node->n && k2 >= node->keys[i2].first)
-                    i2++;
+                while (i2 < node->n && k2 >= node->keys[i2].first) i2++;
 
                 // In the same range, go to that child
                 if (i1 == i2)
@@ -413,169 +350,125 @@ namespace btree_henn
                 }
             }
 
-            // Debug output
-            cout << "Split node keys: ";
-            for (int i = 0; i < split_node->n; i++)
-            {
-                cout << split_node->keys[i].first << " ";
-            }
-            cout << endl;
+            vector<pair<T, int>> indices_not_covered;
 
             if (split_node == nullptr)
-                return canonical_nodes;
-
-            // Store a list of indices of keys in the nodes that we traverse down
-            vector<pair<T, int>> indices_not_covered;
-            for (int i = i1; i < i2; i++)
             {
-                indices_not_covered.push_back(make_pair(split_node->keys[i].first, split_node->keys[i].second));
-            }
-
-            // Left path: walk down to leaf, add all the children nodes to the right
-            BTreeNode<T, ORDER> *left_node = split_node->children[i1];
-            while (left_node != nullptr)
-            {
-                int index = 0;
-                for (int i = 0; i < left_node->n; i++)
-                {
-                    if (k1 <= left_node->keys[i].first)
-                    {
-                        // Add all children to the right of the current position
-                        for (int j = i + 1; j <= left_node->n; j++)
-                        {
-                            if (left_node->children[j] != nullptr)
-                            {
-                                canonical_nodes.push_back(left_node->children[j]);
-                            }
-                        }
-
-                        // Add all the key to the right of current position
-                        for (; i < left_node->n; i++)
-                        {
-                            indices_not_covered.push_back(make_pair(left_node->keys[i].first, left_node->keys[i].second));
-                        }
-                        break;
-                    }
-                    else
-                    {
-                        index = i + 1;
+                i1 = 0;
+                while (i1 < node->n && k1 > node->keys[i1].first) i1++; 
+                for(int i=0; i<node->n; i++) {
+                    if (node->keys[i].first >= k1 && node->keys[i].first <= k2) {
+                        indices_not_covered.push_back(node->keys[i]);
                     }
                 }
-                left_node = left_node->children[index];
             }
-
-            // Right path: walk down to leaf, add all the children nodes to the left
-            BTreeNode<T, ORDER> *right_node = split_node->children[i2];
-            while (right_node != nullptr)
+            else
             {
-                int index = right_node->n; // Default to rightmost child
-                for (int i = right_node->n - 1; i >= 0; i--)
+                for (int i = i1; i < i2; i++)
                 {
-                    if (k2 >= right_node->keys[i].first)
-                    {
-                        // Add all children to the left of the current position
-                        for (int j = 0; j <= i; j++)
-                        {
-                            if (right_node->children[j] != nullptr)
-                            {
-                                canonical_nodes.push_back(right_node->children[j]);
-                            }
-                        }
-                        index = i + 1;
-
-                        // Add all the key to the left of current position
-                        for (int j = 0; j <= i; j++)
-                        {
-                            indices_not_covered.push_back(make_pair(right_node->keys[j].first, right_node->keys[j].second));
-                        }
-                        break;
-                    }
+                    indices_not_covered.push_back(split_node->keys[i]);
                 }
-                right_node = right_node->children[index];
+
+                BTreeNode<T, ORDER> *left_node = split_node->children[i1];
+                while (left_node != nullptr)
+                {
+                    int index = 0;
+                    bool found_split = false;
+
+                    for (int i = 0; i < left_node->n; i++)
+                    {
+                        if (k1 <= left_node->keys[i].first)
+                        {
+                            // Add right-side siblings
+                            for (int j = i + 1; j <= left_node->n; j++)
+                                if (!left_node->leaf && left_node->children[j]) 
+                                    canonical_nodes.push_back(left_node->children[j]);
+
+                            // Add keys >= k1
+                            for (int k = i; k < left_node->n; k++)
+                                indices_not_covered.push_back(left_node->keys[k]);
+
+                            index = i;
+                            found_split = true;
+                            break;
+                        }
+                    }
+
+                    if (!found_split) index = left_node->n;
+                    
+                    if (left_node->leaf) break; // Terminate loop if we are at leaf
+                    left_node = left_node->children[index];
+                }
+
+                // Right path: from split_node->children[i2] down to leaf
+                BTreeNode<T, ORDER> *right_node = split_node->children[i2];
+                while (right_node != nullptr)
+                {
+                    int index = 0; 
+                    bool found_split = false;
+                    for (int i = right_node->n - 1; i >= 0; i--)
+                    {
+                        if (k2 >= right_node->keys[i].first)
+                        {
+                            // Add left-side siblings
+                            for (int j = 0; j <= i; j++)
+                                if (!right_node->leaf && right_node->children[j]) 
+                                    canonical_nodes.push_back(right_node->children[j]);
+
+                            // Add keys <= k2
+                            for (int k = 0; k <= i; k++)
+                                indices_not_covered.push_back(right_node->keys[k]);
+
+                            index = i + 1;
+                            found_split = true;
+                            break;
+                        }
+                    }
+                    if (!found_split) index = 0; // If k2 is smaller than all, go leftmost
+
+                    if (right_node->leaf) break; // Terminate loop if we are at leaf
+                    right_node = right_node->children[index];
+                }
             }
 
-            // Finally, create a new dummy node to cover the remaining indices
             if (!indices_not_covered.empty())
             {
                 BTreeNode<T, ORDER> *dummy_node = createDummyNodeFromIndices(indices_not_covered);
-                canonical_nodes.push_back(dummy_node);
+                if(dummy_node) canonical_nodes.push_back(dummy_node);
             }
 
             return canonical_nodes;
         }
 
-        // Function to search a key in the tree
         auto rangeSearchKNN(T k1, T k2, float *data, int k)
         {
             auto result = std::priority_queue<std::pair<float, hnswlib::labeltype>>();
             auto nodes = findCanonicalNodes(k1, k2);
             for (auto node : nodes)
             {
-                cout << "Canonical node keys: ";
-                for (int i = 0; i < node->n; i++)
-                {
-                    cout << node->keys[i].first << " ";
-                }
-                cout << endl;
                 auto node_results = node->searchKNN(data, k);
-                for (; !node_results.empty(); node_results.pop())
+                while (!node_results.empty())
                 {
                     result.push(node_results.top());
+                    node_results.pop();
                 }
-                for (; result.size() > k;)
+                // Keep only top k global results (Optimization)
+                while (result.size() > k)
                 {
                     result.pop();
+                }
+
+                // Cleanup dummy node
+                if (node->is_temporary) {
+                    delete node;
                 }
             }
             return result;
         }
 
-        // debugging function to perform KNN search on root node
-        void knnOnRootNode(float *data, int k)
-        {
-            if (!root || !root->henn_index)
-            {
-                cout << "No HENN index available on root node" << endl;
-                return;
-            }
-
-            cout << "Root node has " << root->henn_indices.size() << " points" << endl;
-            cout << "Query point: [" << data[0] << ", " << data[1] << "]" << endl;
-
-            auto result = root->searchKNN(data, k);
-            cout << "KNN results for root node:" << endl;
-            int count = 0;
-            while (!result.empty() && count < k)
-            {
-                auto pair = result.top();
-                cout << "Distance: " << pair.first << ", Original Index: " << pair.second;
-                if (pair.second < n)
-                {
-                    cout << " (Data: [" << henn_data[pair.second * dim] << ", " << henn_data[pair.second * dim + 1] << "])";
-                }
-                cout << endl;
-                result.pop();
-                count++;
-            }
-        }
-
-        // Function to get the root node (for testing and debugging)
-        BTreeNode<T, ORDER> *getRoot() const
-        {
-            return root;
-        }
-
-        // Function to print detailed tree structure
         void printTreeStructure() const
         {
-            cout << "=== B-Tree Structure (ORDER=" << ORDER << ") ===" << endl;
-            if (root == nullptr)
-            {
-                cout << "Tree is empty" << endl;
-                return;
-            }
-            printTreeStructureHelper(root, 0, "Root: ");
-            cout << endl;
+            if (root) printTreeStructureHelper(root, 0, "Root: ");
         }
     };
 }

@@ -47,16 +47,6 @@ public:
         btree->insert(key, index);
     }
 
-    auto knnOnRootNode(py::array_t<float> query, int k)
-    {
-        py::buffer_info buf = query.request();
-        if (buf.ndim != 1)
-        {
-            throw std::runtime_error("Query must be 1-dimensional");
-        }
-        return btree->knnOnRootNode(static_cast<float *>(buf.ptr), k);
-    }
-
     void findCanonicalNodes(T min, T max)
     {
         auto nodes = btree->findCanonicalNodes(min, max);
@@ -105,8 +95,6 @@ PYBIND11_MODULE(bthenn, m)
              "Build B-Tree with HENN indexes")
         .def("insert", &BtHennIndex<float, 16>::insert, "key"_a, "index"_a,
              "Insert a key-index pair into the B-Tree")
-        .def("knnOnRootNode", &BtHennIndex<float, 16>::knnOnRootNode, "query"_a, "k"_a,
-             "Perform KNN search on the root node")
         .def("findCanonicalNodes", &BtHennIndex<float, 16>::findCanonicalNodes, "min"_a, "max"_a,
              "Find canonical nodes for range [min, max]")
         .def("print_tree_structure", &BtHennIndex<float, 16>::printTreeStructure,
