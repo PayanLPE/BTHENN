@@ -3,6 +3,7 @@ build/
 dist/
 tmp/
 python_bindings/tests/__pycache__/
+.venv/
 *.pyd
 hnswlib.cpython*.so
 var/
