@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""BtHENN vs HENN experiment on MNIST.
+"""BtHENN vs HENN experiment on MNIST / GloVe / SIFT.
 
 This script:
 - Downloads/parses MNIST (no sklearn/tensorflow dependency).
+- Loads GloVe vectors (from a local file or Stanford's glove.6B.zip).
+- Loads SIFT vectors (from local .fvecs/.ivecs files).
 - Builds BtHENN (B-tree + HENN hybrid) where the B-tree key is a *quantitative*
 	per-vector label.
 - Builds standalone HENN (hnswlib with build_henn).
@@ -11,8 +13,7 @@ This script:
 
 Label modes:
 - "id" (default): each entry gets a unique numeric label 0..n_train-1.
-- "digit": label is the MNIST digit (0..9).
-- "random": label is a deterministic random float in [0, 1).
+- "random": label is a deterministic random float in [low, high].
 
 Reports:
 - Index build time (BtHENN vs HENN)
@@ -26,13 +27,14 @@ from __future__ import annotations
 
 import argparse
 import gzip
-import json
 import struct
 import time
 import urllib.request
-from dataclasses import asdict, dataclass
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, IO, List, Optional, Sequence, Tuple
+import tarfile
 
 import numpy as np
 
@@ -47,6 +49,31 @@ MNIST_FILES = {
 	"test_images": "t10k-images-idx3-ubyte.gz",
 	"test_labels": "t10k-labels-idx1-ubyte.gz",
 }
+
+GLOVE_ZIP_URL = "https://nlp.stanford.edu/data/glove.6B.zip"
+
+
+def _cache_dir(name: str) -> Path:
+	path = Path.home() / ".cache" / "bthenn" / name
+	path.mkdir(parents=True, exist_ok=True)
+	return path
+
+
+def _download(url: str, dest: Path) -> None:
+	dest.parent.mkdir(parents=True, exist_ok=True)
+	with urllib.request.urlopen(url) as response, open(dest, "wb") as f:
+		f.write(response.read())
+
+
+def _download_any(urls: Sequence[str], dest: Path) -> None:
+	last_err: Optional[BaseException] = None
+	for url in urls:
+		try:
+			_download(url, dest)
+			return
+		except BaseException as e:
+			last_err = e
+	raise RuntimeError(f"Failed to download {dest.name} from any known URL") from last_err
 
 # reference: https://www.kaggle.com/code/hojjatk/read-mnist-dataset
 def _read_idx_images_gz(path: Path) -> np.ndarray:
@@ -72,8 +99,7 @@ def _read_idx_labels_gz(path: Path) -> np.ndarray:
 
 
 def load_mnist() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-	cache_dir = Path.home() / ".cache" / "bthenn" / "mnist"
-	cache_dir.mkdir(parents=True, exist_ok=True)
+	cache_dir = _cache_dir("mnist")
 	paths = {k: cache_dir / v for k, v in MNIST_FILES.items()}
 	for v in MNIST_FILES.values():
 		url = MNIST_BASE_URL + v
@@ -81,14 +107,128 @@ def load_mnist() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 		dest.parent.mkdir(parents=True, exist_ok=True)
 		if dest.exists() and dest.stat().st_size > 0:
 			continue
-		with urllib.request.urlopen(url) as response, open(dest, "wb") as f:
-			f.write(response.read())
+		_download(url, dest)
 
 	x_train_u8 = _read_idx_images_gz(paths["train_images"])
 	y_train_u8 = _read_idx_labels_gz(paths["train_labels"])
 	x_test_u8 = _read_idx_images_gz(paths["test_images"])
 	y_test_u8 = _read_idx_labels_gz(paths["test_labels"])
 	return x_train_u8, y_train_u8, x_test_u8, y_test_u8
+
+
+def _read_fvecs_partial(path: Path, n: int) -> np.ndarray:
+	"""Read first n vectors from a .fvecs file into float32 array [n, d]."""
+	if n <= 0:
+		return np.zeros((0, 0), dtype=np.float32)
+	with open(path, "rb") as f:
+		d = np.fromfile(f, dtype=np.int32, count=1)
+		if d.size != 1:
+			raise ValueError(f"Empty/invalid fvecs file: {path}")
+		dim = int(d[0])
+		f.seek(0)
+		count = int(n) * int(dim + 1)
+		raw = np.fromfile(f, dtype=np.float32, count=count)
+	if raw.size % (dim + 1) != 0:
+		# File ended early; still return what we have.
+		raw = raw[: (raw.size // (dim + 1)) * (dim + 1)]
+	arr = raw.reshape(-1, dim + 1)[:, 1:]
+	return arr.astype(np.float32, copy=False)
+
+
+def _load_glove_vectors_from_text(f: IO[bytes], *, max_rows: int, dim: int) -> np.ndarray:
+	vectors: List[np.ndarray] = []
+	for i, raw_line in enumerate(f):
+		if i >= max_rows:
+			break
+		line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, (bytes, bytearray)) else str(raw_line)
+		parts = line.strip().split()
+		if len(parts) != dim + 1:
+			continue
+		vec = np.asarray(parts[1:], dtype=np.float32)
+		if vec.shape[0] != dim:
+			continue
+		vectors.append(vec)
+	if not vectors:
+		raise RuntimeError("No valid GloVe vectors parsed")
+	return np.vstack(vectors).astype(np.float32, copy=False)
+
+
+def load_glove(*, n_train: int, n_query: int, dim: int) -> Tuple[np.ndarray, np.ndarray]:
+	"""Load a small prefix of glove.6B.{dim}d vectors for train/query."""
+	max_rows = int(n_train) + int(n_query)
+	if max_rows <= 0:
+		raise ValueError("n_train + n_query must be > 0")
+	if dim not in (50, 100, 200, 300):
+		raise ValueError("glove_dim must be one of 50/100/200/300")
+
+	# Prefer an explicit path if provided, otherwise try ./datasets then cache.
+	cache_dir = _cache_dir("glove")
+	zip_path = cache_dir / "glove.6B.zip"
+	if (not zip_path.exists() or zip_path.stat().st_size == 0):
+		_download(GLOVE_ZIP_URL, zip_path)
+	if not zip_path.exists():
+		raise FileNotFoundError(
+			"Missing GloVe data. Provide --glove-path or re-run with --download-datasets "
+			"to fetch glove.6B.zip into ~/.cache/bthenn/glove/."
+		)
+	inner_name = f"glove.6B.{int(dim)}d.txt"
+	with zipfile.ZipFile(zip_path, "r") as zf:
+		if inner_name not in zf.namelist():
+			raise FileNotFoundError(f"{inner_name} not found inside {zip_path}")
+		with zf.open(inner_name, "r") as f:
+			all_vecs = _load_glove_vectors_from_text(f, max_rows=max_rows, dim=int(dim))
+
+	if all_vecs.shape[0] < max_rows:
+		raise RuntimeError(f"Not enough GloVe vectors loaded: needed {max_rows}, got {all_vecs.shape[0]}")
+	x_train = all_vecs[: int(n_train)]
+	x_query = all_vecs[int(n_train) : int(n_train) + int(n_query)]
+	return x_train, x_query
+
+
+def load_sift(*, n_train: int, n_query: int) -> Tuple[np.ndarray, np.ndarray]:
+	"""Load SIFT1M base/query vectors (partial read)."""
+	# Prefer ./datasets/sift, else ~/.cache/bthenn/sift, else an explicit --sift-dir.
+	base_dir = Path("datasets") / "sift"
+	if not base_dir.exists():
+		base_dir = _cache_dir("sift")
+
+	base_path = base_dir / "sift_base.fvecs"
+	query_path = base_dir / "sift_query.fvecs"
+	if (not base_path.exists() or not query_path.exists()):
+		base_dir.mkdir(parents=True, exist_ok=True)
+		# Download and extract sift.tar.gz
+		tar_path = base_dir / "sift.tar.gz"
+		if not tar_path.exists():
+			# Try multiple mirrors for sift.tar.gz
+			candidates = [
+				"ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
+				"http://corpus-texmex.irisa.fr/texmex/corpus/sift.tar.gz",
+			]
+			_download_any(candidates, tar_path)
+		# Extract the tar.gz file
+		if tar_path.exists() and (not base_path.exists() or not query_path.exists()):
+			with tarfile.open(tar_path, "r:gz") as tar:
+				tar.extractall(path=base_dir)
+		
+		# After extraction, the files should be in base_dir/sift/
+		extracted_dir = base_dir / "sift"
+		if extracted_dir.exists():
+			if not base_path.exists() and (extracted_dir / "sift_base.fvecs").exists():
+				base_path = extracted_dir / "sift_base.fvecs"
+			if not query_path.exists() and (extracted_dir / "sift_query.fvecs").exists():
+				query_path = extracted_dir / "sift_query.fvecs"
+
+	if not base_path.exists() or not query_path.exists():
+		raise FileNotFoundError(
+			f"Missing SIFT data. Download sift.tar.gz and extract to {base_dir}/ "
+			f"or put sift_base.fvecs and sift_query.fvecs directly under {base_dir}/"
+		)
+
+	x_train = _read_fvecs_partial(base_path, int(n_train))
+	x_query = _read_fvecs_partial(query_path, int(n_query))
+	if x_train.size == 0 or x_query.size == 0:
+		raise RuntimeError("Failed to load SIFT vectors (empty arrays)")
+	return x_train, x_query
 
 
 def _recall_at_k(found: Sequence[int], truth: Sequence[int], k: int) -> float:
@@ -116,7 +256,7 @@ def _exact_topk_within_subset(
 	q = query.astype(np.float32, copy=False)
 	q_norm = float(np.dot(q, q))
 	x_sub = x_train[subset_idx]
-	d2 = x_train_norms[subset_idx] + q_norm - 2.0 * (x_sub @ q)
+	d2 = x_train_norms[subset_idx] + q_norm - 2.0 * (x_sub @ q) # type: ignore
 	k_eff = min(k, d2.shape[0])
 	if k_eff <= 0:
 		return []
@@ -136,12 +276,25 @@ def _make_range_filter(labels: np.ndarray, lo: float, hi: float) -> Callable[[in
 	return _f
 
 
-def _labels_for_mode(*, mode: str, y_train_digits: np.ndarray, low: float, high: float, rng: np.random.Generator) -> np.ndarray:
+def _labels_for_mode(
+	*,
+	mode: str,
+	y_train_digits: Optional[np.ndarray],
+	low: float,
+	high: float,
+	rng: np.random.Generator,
+) -> np.ndarray:
 	mode_l = mode.strip().lower()
 	if mode_l == "id":
-		return np.arange(y_train_digits.shape[0], dtype=np.float32)
+		if y_train_digits is not None:
+			return np.arange(y_train_digits.shape[0], dtype=np.float32)
+		raise ValueError("Internal error: y_train_digits is None for id-mode")
 	if mode_l == "random":
-		return rng.random(y_train_digits.shape[0], dtype=np.float32) * (high - low) + low
+		if y_train_digits is None:
+			raise ValueError("Internal error: y_train_digits is None for random-mode")
+		u = rng.random(y_train_digits.shape[0]).astype(np.float32, copy=False)
+		return u * (float(high) - float(low)) + float(low)
+	raise ValueError(f"Unknown label mode: {mode}")
 
 
 def _pick_range_for_query(
@@ -155,7 +308,7 @@ def _pick_range_for_query(
 	hw = float(width) / 2.0
 	lo = center - hw
 	hi = center + hw
-	# Clamp to global min/max so digit-mode doesn't create empty ranges too often.
+	# Clamp to global min/max so sampled ranges stay in-bounds.
 	lo = max(lo, float(np.min(labels)))
 	hi = min(hi, float(np.max(labels)))
 	if lo > hi:
@@ -188,6 +341,7 @@ class Results:
 
 def run_experiment(
 	*,
+	dataset: str,
 	n_train: int,
 	n_query: int,
 	k: int,
@@ -199,21 +353,46 @@ def run_experiment(
 	ef_construction: int,
 	ef: int,
 	best: bool,
+	glove_dim: int = 100,
 ) -> Results:
-	x_train_u8, y_train_u8, x_test_u8, y_test_u8 = load_mnist()
 	rng = np.random.default_rng(seed)
+	ds = dataset.strip().lower()
+	label_mode_l = label_mode.strip().lower()
+	if ds not in ("mnist", "glove", "sift"):
+		raise ValueError("dataset must be one of: mnist, glove, sift")
+	if label_mode_l not in ("id", "random"):
+		raise ValueError("label_mode must be one of: id, random")
 
-	n_train = min(n_train, x_train_u8.shape[0])
-	n_query = min(n_query, x_test_u8.shape[0])
-	train_idx = rng.choice(x_train_u8.shape[0], size=n_train, replace=False)
-	query_idx = rng.choice(x_test_u8.shape[0], size=n_query, replace=False)
+	# --- Load dataset ---
+	if ds == "mnist":
+		x_train_u8, y_train_u8, x_test_u8, _y_test_u8 = load_mnist()
+		n_train = min(n_train, x_train_u8.shape[0])
+		n_query = min(n_query, x_test_u8.shape[0])
+		train_idx = rng.choice(x_train_u8.shape[0], size=n_train, replace=False)
+		query_idx = rng.choice(x_test_u8.shape[0], size=n_query, replace=False)
+		x_train = (x_train_u8[train_idx].astype(np.float32) / 255.0).astype(np.float32, copy=False)
+		y_train_digits = y_train_u8[train_idx].astype(np.int32)
+		x_query = (x_test_u8[query_idx].astype(np.float32) / 255.0).astype(np.float32, copy=False)
+	elif ds == "glove":
+		x_train, x_query = load_glove(n_train=int(n_train), n_query=int(n_query), dim=int(glove_dim))
+		y_train_digits = None
+	else:
+		x_train, x_query = load_sift(n_train=int(n_train), n_query=int(n_query))
+		y_train_digits = None
 
-	x_train = (x_train_u8[train_idx].astype(np.float32) / 255.0).astype(np.float32, copy=False)
-	y_train_int = y_train_u8[train_idx].astype(np.int32)
-	labels = _labels_for_mode(mode=label_mode, y_train_digits=y_train_int, low=low_high[0] if low_high is not None else 0, high=low_high[1] if low_high is not None else 200, rng=rng)
-
-	x_query = (x_test_u8[query_idx].astype(np.float32) / 255.0).astype(np.float32, copy=False)
-	# Query vectors come from MNIST test set; they don't need labels.
+	# --- Labels for range filtering ---
+	if low_high is None and label_mode_l == "random":
+		low_high = (0.0, float(max(int(x_train.shape[0]) - 1, 1)))
+	# For non-MNIST, synthesize a dummy y_train_digits array for sizing.
+	if y_train_digits is None:
+		y_train_digits = np.zeros((x_train.shape[0],), dtype=np.int32)
+	labels = _labels_for_mode(
+		mode=label_mode_l,
+		y_train_digits=y_train_digits,
+		low=low_high[0] if low_high is not None else 0.0,
+		high=low_high[1] if low_high is not None else float(max(int(x_train.shape[0]) - 1, 1)),
+		rng=rng,
+	)
 
 	dim = int(x_train.shape[1])
 	x_train_norms = np.sum(x_train * x_train, axis=1).astype(np.float32)
@@ -226,7 +405,7 @@ def run_experiment(
 		raise ValueError("range_width must be > 0")
 
 	# --- Build BtHENN ---
-	tree = bthenn.Index16()
+	tree = bthenn.Index16()  # type: ignore[attr-defined]
 	t0 = time.perf_counter()
 	tree.build_btree_henn(x_train, labels, int(x_train.shape[0]), int(x_train.shape[1]))
 	t1 = time.perf_counter()
@@ -346,6 +525,13 @@ def run_experiment(
 
 def main() -> None:
 	parser = argparse.ArgumentParser(description="BtHENN vs HENN benchmark on MNIST")
+	parser.add_argument(
+		"--dataset",
+		type=str,
+		default="mnist",
+		choices=["mnist", "glove", "sift"],
+		help="Which dataset to run: mnist, glove, or sift",
+	)
 	parser.add_argument("--n-train", type=int, default=10000)
 	parser.add_argument("--n-query", type=int, default=200)
 	parser.add_argument("-k", type=int, default=10)
@@ -368,23 +554,26 @@ def main() -> None:
 	parser.add_argument("--ef-construction", type=int, default=100)
 	parser.add_argument("--ef", type=int, default=50)
 	parser.add_argument("--best", action="store_true", help="Use best=True for build_henn")
+	parser.add_argument("--glove-dim", type=int, default=100, choices=[50, 100, 200, 300], help="GloVe dimensionality (glove.6B.{dim}d)")
 	args = parser.parse_args()
 
 	results = run_experiment(
+		dataset=args.dataset,
 		n_train=args.n_train,
 		n_query=args.n_query,
 		k=args.k,
 		seed=args.seed,
 		label_mode=args.label_mode,
-		low_high=tuple(args.low_high),
+		low_high=tuple(args.low_high) if args.low_high is not None else None,
 		range_width=args.range_width,
 		M=args.M,
 		ef_construction=args.ef_construction,
 		ef=args.ef,
 		best=args.best,
+		glove_dim=args.glove_dim,
 	)
 
-	print("=== BtHENN vs HENN (MNIST label-range queries) ===")
+	print(f"=== BtHENN vs HENN ({args.dataset} label-range queries) ===")
 	print(
 		f"n_train={results.n_train} n_query={results.n_query} evaluated={results.n_query_evaluated} "
 		f"dim={results.dim} k={results.k} label_mode={results.label_mode} range_width={results.range_width}"
