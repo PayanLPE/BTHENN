@@ -231,6 +231,14 @@ def load_sift(*, n_train: int, n_query: int) -> Tuple[np.ndarray, np.ndarray]:
 	return x_train, x_query
 
 
+def load_random(*, n_train: int, n_query: int, dim: int, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+	"""Generate random vectors with no pattern for train/query."""
+	rng = np.random.default_rng(seed)
+	x_train = rng.random((n_train, dim), dtype=np.float32)
+	x_query = rng.random((n_query, dim), dtype=np.float32)
+	return x_train, x_query
+
+
 def _recall_at_k(found: Sequence[int], truth: Sequence[int], k: int) -> float:
 	if k <= 0:
 		return 0.0
@@ -358,8 +366,8 @@ def run_experiment(
 	rng = np.random.default_rng(seed)
 	ds = dataset.strip().lower()
 	label_mode_l = label_mode.strip().lower()
-	if ds not in ("mnist", "glove", "sift"):
-		raise ValueError("dataset must be one of: mnist, glove, sift")
+	if ds not in ("mnist", "glove", "sift", "random"):
+		raise ValueError("dataset must be one of: mnist, glove, sift, random")
 	if label_mode_l not in ("id", "random"):
 		raise ValueError("label_mode must be one of: id, random")
 
@@ -376,8 +384,11 @@ def run_experiment(
 	elif ds == "glove":
 		x_train, x_query = load_glove(n_train=int(n_train), n_query=int(n_query), dim=int(glove_dim))
 		y_train_digits = None
-	else:
+	elif ds == "sift":
 		x_train, x_query = load_sift(n_train=int(n_train), n_query=int(n_query))
+		y_train_digits = None
+	else:  # random
+		x_train, x_query = load_random(n_train=int(n_train), n_query=int(n_query), dim=int(glove_dim), seed=int(seed))
 		y_train_digits = None
 
 	# --- Labels for range filtering ---
@@ -529,8 +540,8 @@ def main() -> None:
 		"--dataset",
 		type=str,
 		default="mnist",
-		choices=["mnist", "glove", "sift"],
-		help="Which dataset to run: mnist, glove, or sift",
+		choices=["mnist", "glove", "sift", "random"],
+		help="Which dataset to run: mnist, glove, sift, or random (uniformly generated)",
 	)
 	parser.add_argument("--n-train", type=int, default=10000)
 	parser.add_argument("--n-query", type=int, default=200)
