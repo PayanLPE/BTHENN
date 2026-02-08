@@ -105,6 +105,10 @@ if(HNSWLIB_EXAMPLES)
     add_executable(hops_compare examples/cpp/henn/hops_compare.cpp)
     target_link_libraries(hops_compare hnswlib)
 
+    # tests
+    add_executable(endtree_augmentation_test tests/cpp/endtree_augmentation_test.cpp)
+    target_link_libraries(endtree_augmentation_test hnswlib)
+
     # # tests
     # add_executable(multivector_search_test tests/cpp/multivector_search_test.cpp)
     # target_link_libraries(multivector_search_test hnswlib)

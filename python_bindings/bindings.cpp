@@ -5,6 +5,7 @@
 #include <pybind11/stl.h>
 #include "hnswlib.h"
 #include "henn.h"
+#include "endtree.h"
 #include <thread>
 #include <atomic>
 #include <stdlib.h>
@@ -892,6 +893,126 @@ public:
     }
 };
 
+class EndTree
+{
+public:
+    std::string space_name;
+    int dim;
+    bool normalize;
+
+    hnswlib::SpaceInterface<float> *space;
+    endtree::EndTreeIndex<float> tree;
+    bool built;
+
+    EndTree(const std::string &space_name, const int dim)
+        : space_name(space_name), dim(dim), normalize(false), space(nullptr), built(false)
+    {
+        if (space_name == "l2")
+        {
+            space = new hnswlib::L2Space(dim);
+        }
+        else if (space_name == "ip")
+        {
+            space = new hnswlib::InnerProductSpace(dim);
+        }
+        else if (space_name == "cosine")
+        {
+            space = new hnswlib::InnerProductSpace(dim);
+            normalize = true;
+        }
+        else
+        {
+            throw std::runtime_error("Space name must be one of l2, ip, or cosine.");
+        }
+    }
+
+    ~EndTree()
+    {
+        delete space;
+    }
+
+    void normalize_vector(const float *data, float *norm_array) const
+    {
+        float norm = 0.0f;
+        for (int i = 0; i < dim; i++)
+            norm += data[i] * data[i];
+        norm = 1.0f / (sqrtf(norm) + 1e-30f);
+        for (int i = 0; i < dim; i++)
+            norm_array[i] = data[i] * norm;
+    }
+
+    void build(py::object input, int M = 1, bool best = true)
+    {
+        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (buffer.ndim != 2)
+            throw std::runtime_error("EndTree.build expects a 2D array of shape (n, dim)");
+
+        if (static_cast<int>(features) != dim)
+            throw std::runtime_error("Wrong dimensionality of the vectors");
+
+        py::gil_scoped_release l;
+
+        if (!normalize)
+        {
+            float *data = static_cast<float *>(items.mutable_data());
+            tree = endtree::buildEndTree(data, static_cast<int>(rows), dim, space, M, best);
+        }
+        else
+        {
+            std::vector<float> normalized(rows * static_cast<size_t>(dim));
+            for (size_t r = 0; r < rows; ++r)
+            {
+                normalize_vector((const float *)items.data(r), &normalized[r * static_cast<size_t>(dim)]);
+            }
+            tree = endtree::buildEndTree(normalized.data(), static_cast<int>(rows), dim, space, M, best);
+        }
+
+        built = true;
+    }
+
+    double outlier_score_path(py::object query_, py::object weights_ = py::none(), size_t ef = 128) const
+    {
+        if (!built || !tree.index)
+            throw std::runtime_error("EndTree is not built. Call build() first.");
+
+        py::array_t<float, py::array::c_style | py::array::forcecast> query_arr(query_);
+        auto qbuf = query_arr.request();
+
+        size_t rows, features;
+        get_input_array_shapes(qbuf, &rows, &features);
+
+        if (rows != 1)
+            throw std::runtime_error("Query must be a 1D vector or a single-row 2D array");
+
+        if (static_cast<int>(features) != dim)
+            throw std::runtime_error("Wrong dimensionality of the query vector");
+
+        std::vector<double> weights;
+        if (!weights_.is_none())
+        {
+            weights = weights_.cast<std::vector<double>>();
+        }
+
+        std::vector<float> qnorm;
+        const float *qptr = (const float *)query_arr.data();
+        if (normalize)
+        {
+            qnorm.resize(static_cast<size_t>(dim));
+            normalize_vector(qptr, qnorm.data());
+            qptr = qnorm.data();
+        }
+
+        py::gil_scoped_release l;
+        auto res = endtree::query_outlier_score_path(tree, qptr, weights, ef);
+        return res.total_score;
+    }
+};
+
 template <typename dist_t, typename data_t = float>
 class BFIndex
 {
@@ -1194,5 +1315,18 @@ PYBIND11_PLUGIN(hnswlib)
         .def("get_max_elements", &BFIndex<float>::getMaxElements)
         .def("get_current_count", &BFIndex<float>::getCurrentCount)
         .def_readwrite("num_threads", &BFIndex<float>::num_threads_default);
+
+    py::class_<EndTree>(m, "EndTree")
+        .def(py::init<const std::string &, const int>(), py::arg("space"), py::arg("dim"))
+        .def("build", &EndTree::build, py::arg("data"), py::arg("M") = 1, py::arg("best") = true)
+        .def("outlier_score_path",
+             &EndTree::outlier_score_path,
+             py::arg("query"),
+             py::arg("weights") = py::none(),
+             py::arg("ef") = 128)
+        .def_readonly("space", &EndTree::space_name)
+        .def_readonly("dim", &EndTree::dim)
+        .def("__repr__", [](const EndTree &a)
+             { return "<hnswlib.EndTree(space='" + a.space_name + "', dim=" + std::to_string(a.dim) + ")>"; });
     return m.ptr();
 }
