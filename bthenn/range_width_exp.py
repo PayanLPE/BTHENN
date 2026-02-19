@@ -37,6 +37,7 @@ def sweep_range_width_to_csv(
             ef_construction=ef_construction,
             ef=ef,
             best=best,
+            glove_dim=128,
         )
         rows.append(asdict(res))
 
@@ -105,8 +106,8 @@ def sweep_range_width_to_csv(
 if __name__ == "__main__":
     # Example: sweep range_width = 5, 6, 7, 8, 9, 10
     widths = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    dataset = "Glove"
-    n_train=5000
+    dataset = "random"
+    n_train=20000
 
     sweep_range_width_to_csv(
         output_path=Path(f"results_{dataset}_id_range_width_{n_train}.csv"),

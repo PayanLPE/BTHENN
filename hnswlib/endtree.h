@@ -13,18 +13,6 @@
 
 #include "henn.h"
 
-// EndTree: HENN + a bottom-up augmentation pass.
-//
-// After constructing the HENN hierarchy (same as `henn::buildHENN`), we assign each point
-// with max level i to a "parent" in the layer above (any point with max level >= i+1).
-// For every parent, we aggregate statistics over its children from layer i:
-//   - count (density)
-//   - coverage radius (max distance parent->child)
-//   - mean/variance of parent->child distances
-//
-// Notes:
-// - Distances are in the units returned by `space->get_dist_func()` / HNSW (e.g. L2 may be squared).
-// - Parent selection uses HNSW search with a filter, with an exact-scan fallback if needed.
 
 namespace endtree {
 
@@ -280,9 +268,14 @@ inline OutlierScoreResult query_outlier_score_path(
 		ls0.dist_q_p = best0.second;
 	}
 
-	// Compute per-layer anomaly score using parent stats (same math as query_outlier_score).
-	constexpr double eps = 1e-12;
-	constexpr double huge = 1e9;
+	// Compute per-layer anomaly score using parent stats.
+	// New formula: Score_dist = log(1 + max(0, d/r - 1))
+	//              Score_density = log(1 + c_ref/(c+1)) / log(1 + c_ref)
+	//              Score_struct = abs(d - mu_d) / max(sigma_d, eps_sigma), with guards
+	constexpr double eps_r = 1e-9;
+	constexpr double eps_sigma = 1e-9;
+	constexpr double c_ref = 10.0;
+	constexpr double Zmax = 10.0;  // Cap for Score_struct to prevent dominance
 
 	for (int layer = max_level - 1; layer >= 0; --layer) {
 		LayerOutlierScore& ls = result.layers[static_cast<size_t>(layer)];
@@ -300,16 +293,31 @@ inline OutlierScoreResult query_outlier_score_path(
 		ls.parent_mean = stats.mean;
 		ls.parent_variance = stats.variance;
 
-		const double dist = static_cast<double>(ls.dist_q_p);
-		const double radius = std::max(static_cast<double>(stats.coverage_radius), eps);
-		ls.score_dist = dist / radius;
+		// Convert squared distances (from L2Space) to true distances
+		const double d = std::sqrt(static_cast<double>(ls.dist_q_p));
+		const double r = std::max(std::sqrt(static_cast<double>(stats.coverage_radius)), eps_r);
+		const double mu_d = std::sqrt(static_cast<double>(stats.mean));
+		const double sigma_d = std::sqrt(static_cast<double>(stats.variance));
+		const double c = static_cast<double>(stats.count);
 
-		ls.score_density = (stats.count == 0) ? huge : (1.0 / static_cast<double>(stats.count));
+		// Score_dist = log(1 + max(0, d/r - 1))
+		ls.score_dist = std::log(1.0 + std::max(0.0, d / r - 1.0));
 
-		const double sigma = std::sqrt(std::max(stats.variance, eps));
-		ls.score_struct = std::fabs(dist - stats.mean) / sigma;
+		// Score_density = log(1 + c_ref/(c+1)) / log(1 + c_ref)
+		ls.score_density = std::log(1.0 + c_ref / (c + 1.0)) / std::log(1.0 + c_ref);
 
-		ls.s = ls.score_dist * ls.score_density * ls.score_struct;
+		// Score_struct with guards:
+		// 1) Use 1.0 (neutral) for tiny clusters (c < 2) to avoid killing the product
+		// 2) Cap at Zmax to prevent dominance
+		if (stats.count < 2) {
+			ls.score_struct = 1.0;  // Neutral value - don't kill the score
+		} else {
+			ls.score_struct = std::fabs(d - mu_d) / std::max(sigma_d, eps_sigma);
+			ls.score_struct = std::min(ls.score_struct, Zmax);
+		}
+
+		// Combined score: s_i = Score_dist * Score_density * Score_struct
+		ls.s = (1 + ls.score_dist) * ls.score_density * ls.score_struct;
 		ls.weight = (static_cast<size_t>(layer) < level_weights.size()) ? level_weights[static_cast<size_t>(layer)] : 1.0;
 		ls.weighted_s = ls.s * ls.weight;
 		result.total_score += ls.weighted_s;
